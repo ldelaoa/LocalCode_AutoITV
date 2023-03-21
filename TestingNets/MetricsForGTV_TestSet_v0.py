@@ -11,8 +11,7 @@ import numpy as np
 from scipy.ndimage import rotate
 import csv
 import SimpleITK as sitk
-#from lungtumormask import mask as tumormask
-from lungmask import mask as lungmask_fun
+import matplotlib.pyplot as plt
 from skimage.measure import label, regionprops
 from skimage.morphology import dilation,ball,erosion
 from monai.utils import first, set_determinism
@@ -49,35 +48,37 @@ from monai.transforms import (
     Transpose,
     ScaleIntensity,
 )
-from monai.networks.nets import SwinUNETR,DynUNet
-from monai.inferers import sliding_window_inference
+
 from monai.data import CacheDataset, DataLoader, Dataset, decollate_batch
 
 from metrics import metrics_fun,saveMetrics_fun
-
 
 
 def LookSortFiles(root_path, all_patientdir):
     CT_fpaths = []
     lbl_fpaths = []
     lung_fpaths = []
+    predicted_fpaths = []
 
     for patient_path in all_patientdir:
         ct_miss = True
         gtv_miss = True
         lung_miss = True
+        predicted_miss = True
         for root, dirs, files in os.walk(root_path + patient_path, topdown=False):
             for f in files:
-                if True:  # 4D Data local
-                    if "ct.nii.gz" in f.lower() and not("ave" in f.lower()):
-                        CT_fpaths.append(os.path.join(root_path, patient_path, f))
-                        ct_miss = False
-                    if "_gtv" in f.lower():
-                        lbl_fpaths.append(os.path.join(root_path, patient_path, f))
-                        gtv_miss = False
-                    if "lungmask.nii.gz" in f.lower() and not("ave" in f.lower()):
-                        lung_fpaths.append(os.path.join(root_path, patient_path, f))
-                        lung_miss = False
+                if "ct.nii.gz" in f.lower() and not("ave" in f.lower()) and not("predicted" in f.lower() and not("lung" in f.lower())):
+                    CT_fpaths.append(os.path.join(root_path, patient_path, f))
+                    ct_miss = False
+                if "_gtv" in f.lower() and not("predicted" in f.lower() and not("lung" in f.lower())):
+                    lbl_fpaths.append(os.path.join(root_path, patient_path, f))
+                    gtv_miss = False
+                if "lungmask.nii.gz" in f.lower() and not("ave" in f.lower()):
+                    lung_fpaths.append(os.path.join(root_path, patient_path, f))
+                    lung_miss = False
+                if "_gtv_predicted12" in f.lower():
+                    predicted_fpaths.append(os.path.join(root_path, patient_path, f))
+                    predicted_miss = False
             if ct_miss and lung_miss:
                 for f in files:
                     if "ex_ct.nii.gz" in f.lower() and ct_miss:
@@ -107,8 +108,10 @@ def LookSortFiles(root_path, all_patientdir):
                 ct_miss = True
                 lung_fpaths.pop()
                 lung_miss = True
+                predicted_miss =True
+                predicted_fpaths.pop()
 
-    print('ct: ', len(CT_fpaths), 'label: ', len(lbl_fpaths), 'lung: ', len(lung_fpaths))
+    print('ct: ', len(CT_fpaths), 'label: ', len(lbl_fpaths), 'lung: ', len(lung_fpaths),'predict:',len(predicted_fpaths))
     if False:
         CreateLungMasks(root_path, CT_fpaths)
         print('Rerun the program')
@@ -117,17 +120,19 @@ def LookSortFiles(root_path, all_patientdir):
     CT_fpaths.sort()
     lbl_fpaths.sort()
     lung_fpaths.sort()
+    predicted_fpaths.sort()
 
     print(CT_fpaths[-1])
     print(lbl_fpaths[-1])
     print(lung_fpaths[-1])
+    print(predicted_fpaths[-1])
 
 
-    if (len(CT_fpaths) != len(lbl_fpaths)) or (len(lbl_fpaths) != len(lung_fpaths)):
+    if (len(CT_fpaths) != len(lbl_fpaths)) or (len(lbl_fpaths) != len(lung_fpaths)) or (len(CT_fpaths) != len(lbl_fpaths)):
         print('Different number of files for each structure')
         exit(1)
 
-    return CT_fpaths, lbl_fpaths, lung_fpaths
+    return CT_fpaths, lbl_fpaths, lung_fpaths,predicted_fpaths
 
 
 # class to transpose lung mask
@@ -150,39 +155,8 @@ class Create_sequences(MapTransform):
 
         return dictionary
 
-        # task06 Lung NSCLC tumor segmentation - medicaldecathlon.com/#tasks
-        # pretrained functions where describred in the github of create_network.py
 
-
-def get_kernels_strides(patch_size, spacing):
-    sizes, spacings = patch_size, spacing
-    input_size = sizes
-    strides, kernels = [], []
-    while True:
-        spacing_ratio = [sp / min(spacings) for sp in spacings]
-        stride = [
-            2 if ratio <= 2 and size >= 8 else 1
-            for (ratio, size) in zip(spacing_ratio, sizes)
-        ]
-        kernel = [3 if ratio <= 2 else 1 for ratio in spacing_ratio]
-        if all(s == 1 for s in stride):
-            break
-        for idx, (i, j) in enumerate(zip(sizes, stride)):
-            if i % j != 0:
-                raise ValueError(
-                    f"Patch size is not supported, please try to modify the size {input_size[idx]} in the spatial dimension {idx}."
-                )
-        sizes = [i / j for i, j in zip(sizes, stride)]
-        spacings = [i * j for i, j in zip(spacings, stride)]
-        kernels.append(kernel)
-        strides.append(stride)
-
-    strides.insert(0, len(spacings) * [1])
-    kernels.append(len(spacings) * [3])
-    return kernels, strides
-
-
-def test(figures_folder_i,image_size,modelSwin,modelDyn, val_loader):
+def test(val_loader):
 
     post_transforms = Compose(
         [
@@ -195,42 +169,23 @@ def test(figures_folder_i,image_size,modelSwin,modelDyn, val_loader):
     )
     post_label = Compose([EnsureType(), AsDiscrete(threshold=0.5)], )
 
-    swinMetrics=[]
-    dynMetrics=[]
     mixedMetrics=[]
     print("Len Valloader: ",len(val_loader))
 
-    modelSwin.eval()
-    modelDyn.eval()
-    with torch.no_grad():
-        for val_data in val_loader:
-            val_inputs, val_labels = (
-                val_data["image"].to(device),
-                val_data["label"].to(device),)
-            roi_size = image_size
-            sw_batch_size = 1
-            px = val_data["image"].to('cpu').meta["filename_or_obj"][0].split('/')[-2]
-            print('Px: ', px)
 
-            val_labels = [post_label(i) for i in decollate_batch(val_labels)]
+    for val_data in val_loader:
+        val_predict, val_labels = (
+            val_data["predict"].to(device),
+            val_data["label"].to(device),)
+        px = val_data["image"].to('cpu').meta["filename_or_obj"][0].split('/')[-2]
+        print('Px: ', px)
 
-            val_outputs_Swin = sliding_window_inference(val_inputs, roi_size, sw_batch_size, modelSwin)
-            val_outPost_Swin = [post_transforms(i) for i in decollate_batch(val_outputs_Swin)]
+        val_labels = [post_label(i) for i in decollate_batch(val_labels)]
+        val_predict= [post_label(i) for i in decollate_batch(val_predict)]
 
-            val_outputs_Dyn = sliding_window_inference(val_inputs, roi_size, sw_batch_size, modelDyn)
-            val_outPost_Dyn = [post_transforms(i) for i in decollate_batch(val_outputs_Dyn)]
+        mixedMetrics.append(metrics_fun(val_predict, val_labels, px, 1))
 
-            val_outPost = torch.logical_or(val_outPost_Swin[0], val_outPost_Dyn[0])
-            val_outPost_format= [torch.unsqueeze(val_outPost[0],dim=0)]
-
-            print("Swin")
-            swinMetrics.append(metrics_fun(val_outPost_Swin,val_labels,px,1))
-            print("Dyn")
-            dynMetrics.append(metrics_fun(val_outPost_Dyn, val_labels, px, 1))
-            print("Mixed")
-            mixedMetrics.append(metrics_fun(val_outPost_format, val_labels, px, 1))
-
-        return swinMetrics,dynMetrics,mixedMetrics
+    return mixedMetrics
 
 
 def main(spec_patient,figures_folder_i,name_run,pretrained_path_Swin,pretrained_path_Dyn,cache,num_workers,root_path):
@@ -240,7 +195,7 @@ def main(spec_patient,figures_folder_i,name_run,pretrained_path_Swin,pretrained_
     all_patientdir.sort()
     print(len(all_patientdir),'in',name_run)
 
-    CT_fpaths, lbl_fpaths, lung_fpaths = LookSortFiles(root_path, all_patientdir)
+    CT_fpaths, lbl_fpaths, lung_fpaths, predict_fpaths = LookSortFiles(root_path, all_patientdir)
 
     # SPECIFIC PX Testing:
 
@@ -251,18 +206,21 @@ def main(spec_patient,figures_folder_i,name_run,pretrained_path_Swin,pretrained_
                 spec_CT_fpaths = CT_fpaths[i]
                 spec_lbl_fpaths = lbl_fpaths[i]
                 spec_lung_fpaths = lung_fpaths[i]
+                spec_predict_fpaths = predict_fpaths[i]
                 break
         CT_fpaths = []
         lbl_fpaths = []
         lung_fpaths = []
+        predict_fpaths = []
         CT_fpaths.append(spec_CT_fpaths)
         lbl_fpaths.append(spec_lbl_fpaths)
         lung_fpaths.append(spec_lung_fpaths)
+        predict_fpaths.append(spec_predict_fpaths)
 
     #Create data dictionat
     data_dicts = [
-        {"image": image_name,"lung":lung_name,"label": label_name}
-        for image_name,lung_name,label_name in zip(CT_fpaths,lung_fpaths,lbl_fpaths)
+        {"image": image_name,"lung":lung_name,"label": label_name,"predict":predict_name}
+        for image_name,lung_name,label_name,predict_name in zip(CT_fpaths,lung_fpaths,lbl_fpaths,predict_fpaths)
     ]
     val_files = data_dicts[:]
     print('train val len:',0,'-',len(val_files))
@@ -272,10 +230,8 @@ def main(spec_patient,figures_folder_i,name_run,pretrained_path_Swin,pretrained_
 
     #Create Compose functions for preprocessing of train and validation
     set_determinism(seed=0)
-    image_keys = ["image","lung","label"]
-    p = .5 #Data aug transform probability
+    image_keys = ["image","lung","label","predict"]
     size = 96
-    image_size = (size,size,size)
     pin_memory = True if num_workers > 0 else False  # Do not change
 
     val_transforms = Compose(
@@ -285,8 +241,8 @@ def main(spec_patient,figures_folder_i,name_run,pretrained_path_Swin,pretrained_
             Orientationd(keys=["image", "label"], axcodes="RAS"),
             # Spacingd(keys=["image","label"], pixdim=(1,1,1),mode=("bilinear","nearest")),
             ScaleIntensityRanged(keys=["image"], a_min=minmin_CT, a_max=maxmax_CT, b_min=0.0, b_max=1.0, clip=True, ),
-            Create_sequences(keys=image_keys),
-            CropForegroundd(keys=image_keys, source_key="lung", k_divisible=size),
+            Create_sequences(keys=["image","lung","label"]),
+            CropForegroundd(keys=["image","lung","label"], source_key="lung", k_divisible=size),
             MaskIntensityd(keys=["image"], mask_key="lung"),
             ToTensord(keys=image_keys),
         ]
@@ -305,59 +261,34 @@ def main(spec_patient,figures_folder_i,name_run,pretrained_path_Swin,pretrained_
         val_ds = Dataset(data=val_files, transform=val_transforms)
         val_loader = DataLoader(val_ds, batch_size=1, num_workers=0)  # ,collate_fn=pad_list_data_collate)
 
-    #Plot Input Volume
-    #plotInputVolume(val_loader, device)
 
-    # Create the model
-    spatial_dims = 3
-    max_epochs = 250
-    in_channels = 1
-    out_channels = 2  # including background
-    lr = 1e-3  # 1e-4
-    weight_decay = 1e-5
-    T_0 = 40  # Cosine scheduler
+    if False:
+        figsize = (18, 9)
+        check_ds = Dataset(data=val_files, transform=val_transforms)
+        check_loader = DataLoader(check_ds, batch_size=1, num_workers=0)
+        count = 1
+        for batch_data in check_loader:
+            # batch_data = first(check_loader)
+            image, lung, label,predict = (batch_data["image"][0][0], batch_data["lung"][0][0], batch_data["label"][0][0],batch_data["predict"][0][0])
+            print(f"px info:{count},image shape: {image.shape},lung shape: {lung.shape}, label shape: {label.shape},predict shape:{predict.shape}")
+            count += 1
+            for i in range(label.shape[2]):
+                if torch.sum(label[:, :, i]) > 0:
+                    fig = plt.figure('Instance = {}'.format(0), figsize=figsize)
+                    plt.subplot(1, 2, 1), plt.imshow(np.rot90(image[:, :, i]), cmap='gray'), plt.axis('off')
+                    plt.subplot(1, 2, 2), plt.imshow(np.rot90(image[:, :, i]), cmap='gray'), plt.axis('off')
+                    plt.contour(np.rot90(lung[:, :, i]), colors='yellow')
+                    plt.contour(np.rot90(label[:, :, i]), colors='red')
+                    plt.contour(np.rot90(predict[:, :, i]), colors='red')
+                    plt.tight_layout(), plt.show()
+                    break
+            if count > 3:
+                break
+            exit(0)
 
-    task_id = "06"
-    deep_supr_num = 1  # when is 3 shape of outputs/labels dont match
-    patch_size = image_size
-    spacing = [1, 1, 1]
-    kernels, strides = get_kernels_strides(patch_size, spacing)
+    metricsMixed = test(val_loader)
 
-    print("MODEL SwinDyn")
-    print("MODEL SWIN")
-    modelSwin = SwinUNETR(
-        image_size,
-        in_channels, out_channels,
-        use_checkpoint=True,
-        feature_size=48,
-        # spatial_dims=spatial_dims
-    ).to(device)
-    task_id = "06"
-    modelDyn = DynUNet(
-        spatial_dims=3,
-        in_channels=in_channels,
-        out_channels=out_channels,
-        kernel_size=kernels,
-        strides=strides,
-        upsample_kernel_size=strides[1:],
-        norm_name="instance",
-        deep_supervision=False,  # when is 3 shape of outputs/labels dont match
-        deep_supr_num=deep_supr_num,
-    ).to(device)
-
-
-    # Load pretrained model
-    if pretrained_path_Swin is not(None):
-        modelSwin.load_state_dict(torch.load(pretrained_path_Swin, map_location=torch.device(device)))
-        print('Using Swin pretrained weights!')
-    if pretrained_path_Dyn is not(None):
-        modelDyn.load_state_dict(torch.load(pretrained_path_Dyn, map_location=torch.device(device)))
-        print('Using Dyn pretrained weights!')
-    metricsSwin,metricsDyn,metricsMixed = test(figures_folder_i ,image_size,modelSwin,modelDyn, val_loader)
-
-    _ = saveMetrics_fun(figures_folder_i, 'metricsSwin_v12.csv', metricsSwin)
-    _ = saveMetrics_fun(figures_folder_i, 'metricsDyn_v12.csv', metricsDyn)
-    _ = saveMetrics_fun(figures_folder_i, 'metricsMix_v12.csv', metricsMixed)
+    _ = saveMetrics_fun(figures_folder_i, 'metricsMix_v12_TP_nodil.csv', metricsMixed)
 
 
 if __name__ == "__main__":

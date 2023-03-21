@@ -14,7 +14,7 @@ def tensor2tensor(tensor_label0,dilation_bool):
     if len(tensor_label0[0].shape)==3:
         lbl_3dnp = tensor_label0.cpu().detach().numpy()
     else:
-        lbl_3dnp = tensor_label0.cpu().detach().numpy()
+        lbl_3dnp = tensor_label0[0].cpu().detach().numpy()
         lbl_3dnp = lbl_3dnp.squeeze()
     if dilation_bool:
         lbl_3dnp = dilation(lbl_3dnp,ball(2))
@@ -47,8 +47,8 @@ def metrics_fun(Metrics_tensor, tensor_label0,px,multiplier):
         print("Dice0 :'{:0.2f}".format(dice0))
         dice_metric.reset()
 
-    label_tensor,propsLabel = tensor2tensor(tensor_label0,True)
-    output_tensor, propsOutput = tensor2tensor(Metrics_tensor,True)
+    label_tensor,propsLabel = tensor2tensor(tensor_label0,False)
+    output_tensor, propsOutput = tensor2tensor(Metrics_tensor,False)
 
     for i in range(len(propsLabel)):
         rr = propsLabel[i]
